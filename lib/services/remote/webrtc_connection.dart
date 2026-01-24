@@ -24,9 +24,6 @@ class WebRTCConnection {
 
   WebRTCConnectionState _state = WebRTCConnectionState.disconnected;
   Completer<bool>? _connectionCompleter;
-  bool _serverHelloReceived = false;
-  Completer<void>? _serverHelloCompleter;
-  Timer? _serverHelloTimer;
 
   // Queue ICE candidates until remote description is set
   final List<RTCIceCandidate> _pendingIceCandidates = [];
@@ -71,9 +68,6 @@ class WebRTCConnection {
     _connectionCompleter = Completer<bool>();
     _remoteDescriptionSet = false;
     _pendingIceCandidates.clear();
-    _serverHelloReceived = false;
-    _serverHelloCompleter = null;
-    _serverHelloTimer?.cancel();
 
     try {
       // Set up signaling callbacks
@@ -184,11 +178,6 @@ class WebRTCConnection {
     _dataChannel = null;
     _sendspinDataChannel = null;
     _peerConnection = null;
-
-    _serverHelloTimer?.cancel();
-    _serverHelloTimer = null;
-    _serverHelloReceived = false;
-    _serverHelloCompleter = null;
     _remoteDescriptionSet = false;
     _pendingIceCandidates.clear();
 
@@ -212,15 +201,9 @@ class WebRTCConnection {
     _sendspinDataChannel = null;
     _peerConnection = null;
 
-    // Cancel server hello timer
-    _serverHelloTimer?.cancel();
-    _serverHelloTimer = null;
-
     // Complete all pending requests with an error before clearing
     _completePendingRequestsWithError('WebRTC connection disconnected');
 
-    _serverHelloReceived = false;
-    _serverHelloCompleter = null;
     _remoteDescriptionSet = false;
     _pendingIceCandidates.clear();
     serverInfo = null;
@@ -266,7 +249,8 @@ class WebRTCConnection {
       _peerConnection!.onConnectionState = _onConnectionState;
       _peerConnection!.onDataChannel = _onDataChannel;
 
-      // Create data channel for MA API
+      // Create BOTH data channels BEFORE sending offer
+      // Both must be in the initial SDP for the server to know about them
       final dataChannelInit = RTCDataChannelInit()
         ..ordered = true
         ..protocol = 'ma-api';
@@ -274,13 +258,14 @@ class WebRTCConnection {
       _dataChannel = await _peerConnection!.createDataChannel('ma-api', dataChannelInit);
       _setupDataChannel(_dataChannel!);
 
-      // Create data channel for Sendspin audio streaming
+      // Create sendspin channel in the same offer
       final sendspinChannelInit = RTCDataChannelInit()
         ..ordered = true
         ..protocol = 'sendspin';
 
       _sendspinDataChannel = await _peerConnection!.createDataChannel('sendspin', sendspinChannelInit);
       _setupSendspinDataChannel(_sendspinDataChannel!);
+      DebugLogger().log('WebRTC: Created both ma-api and sendspin channels');
 
       // Create and send offer
       final offer = await _peerConnection!.createOffer();
@@ -408,35 +393,13 @@ class WebRTCConnection {
       DebugLogger().log('WebRTC: Data channel state: $state');
 
       if (state == RTCDataChannelState.RTCDataChannelOpen) {
-        DebugLogger().log('WebRTC: Data channel open - waiting for server hello...');
-
-        // Only create completer if not already created/completed
-        if (_serverHelloCompleter == null || _serverHelloCompleter!.isCompleted) {
-          _serverHelloCompleter = Completer<void>();
-        }
-
-        // Set up server hello timeout (30 seconds)
-        _serverHelloTimer?.cancel();
-        _serverHelloTimer = Timer(const Duration(seconds: 30), () {
-          if (!_serverHelloReceived && _serverHelloCompleter != null && !_serverHelloCompleter!.isCompleted) {
-            DebugLogger().log('WebRTC: Server hello timeout - connection failed');
-            _serverHelloCompleter!.completeError('Server hello timeout');
-            _onSignalingError('Server hello timeout - remote server did not respond');
-          }
-        });
-
-        _serverHelloCompleter!.future.then((_) {
-          _serverHelloTimer?.cancel();
-          DebugLogger().log('WebRTC: Server hello received - connection complete!');
-          _setState(WebRTCConnectionState.connected);
-          _safeCompleteConnection(true);
-        }).catchError((error) {
-          // Timeout or other error handled above
-          DebugLogger().log('WebRTC: Server hello error: $error');
-        });
+        // Mark connected IMMEDIATELY on channel open (like MA Web App does)
+        // Don't wait for server hello - just mark connected and let messages flow
+        DebugLogger().log('WebRTC: Data channel open - marking connected!');
+        _setState(WebRTCConnectionState.connected);
+        _safeCompleteConnection(true);
       } else if (state == RTCDataChannelState.RTCDataChannelClosed) {
-        DebugLogger().log('WebRTC: Data channel closed, completing pending requests with error');
-        _serverHelloTimer?.cancel();
+        DebugLogger().log('WebRTC: Data channel closed');
         _completePendingRequestsWithError('Data channel closed');
         _setState(WebRTCConnectionState.disconnected);
       }
@@ -454,11 +417,9 @@ class WebRTCConnection {
       DebugLogger().log('WebRTC: Parsed message keys: ${data.keys.toList()}, message_id: $messageId');
 
       // Check for server hello message (has server_id but no message_id)
-      if (data.containsKey('server_id') && messageId == null && !_serverHelloReceived) {
+      if (data.containsKey('server_id') && messageId == null && serverInfo == null) {
         DebugLogger().log('WebRTC: Server hello received - server_version: ${data['server_version']}');
         serverInfo = data;
-        _serverHelloReceived = true;
-        _serverHelloCompleter?.complete();
         // Don't forward server hello to rawMessages - bridge caches it separately
         return;
       }
@@ -479,6 +440,54 @@ class WebRTCConnection {
       _messageController.add(data);
     } catch (e) {
       DebugLogger().log('WebRTC: Failed to parse message: $e');
+    }
+  }
+
+  /// Create sendspin data channel on demand (call AFTER API channel is working)
+  Future<bool> createSendspinChannel() async {
+    if (_peerConnection == null) {
+      DebugLogger().log('WebRTC: Cannot create sendspin channel - no peer connection');
+      return false;
+    }
+
+    if (_sendspinDataChannel != null) {
+      DebugLogger().log('WebRTC: Sendspin channel already exists');
+      return true;
+    }
+
+    try {
+      DebugLogger().log('WebRTC: Creating sendspin data channel...');
+      DebugLogger().log('WebRTC: Peer connection state: ${_peerConnection!.connectionState}');
+
+      final sendspinChannelInit = RTCDataChannelInit()
+        ..ordered = true
+        ..protocol = 'sendspin';
+
+      _sendspinDataChannel = await _peerConnection!.createDataChannel('sendspin', sendspinChannelInit);
+      _setupSendspinDataChannel(_sendspinDataChannel!);
+
+      final initialState = _sendspinDataChannel!.state;
+      DebugLogger().log('WebRTC: Sendspin data channel created, initial state: $initialState');
+
+      // If channel is not immediately open, wait a bit
+      if (initialState != RTCDataChannelState.RTCDataChannelOpen) {
+        DebugLogger().log('WebRTC: Waiting for sendspin channel to open...');
+        // Wait up to 5 seconds for the channel to open
+        for (int i = 0; i < 50; i++) {
+          await Future.delayed(const Duration(milliseconds: 100));
+          final state = _sendspinDataChannel?.state;
+          if (state == RTCDataChannelState.RTCDataChannelOpen) {
+            DebugLogger().log('WebRTC: Sendspin channel opened after ${(i + 1) * 100}ms');
+            return true;
+          }
+        }
+        DebugLogger().log('WebRTC: Sendspin channel did not open within 5s, state: ${_sendspinDataChannel?.state}');
+      }
+
+      return true;
+    } catch (e) {
+      DebugLogger().log('WebRTC: Failed to create sendspin channel: $e');
+      return false;
     }
   }
 
@@ -512,13 +521,13 @@ class WebRTCConnection {
   /// Send a text message to Sendspin channel (JSON control messages)
   void sendSendspinText(String message) {
     if (_sendspinDataChannel == null) {
-      DebugLogger().log('WebRTC: Cannot send sendspin text - channel is null');
+      DebugLogger().log('WebRTC: Cannot send sendspin text - sendspin data channel is NULL (was never created or was disposed)');
       return;
     }
 
     final state = _sendspinDataChannel!.state;
     if (state != RTCDataChannelState.RTCDataChannelOpen) {
-      DebugLogger().log('WebRTC: Cannot send sendspin text - channel state: $state');
+      DebugLogger().log('WebRTC: Cannot send sendspin text - sendspin channel state is: $state (not open)');
       return;
     }
 
@@ -574,10 +583,6 @@ class WebRTCConnection {
   /// Dispose resources. Note: This schedules disconnect() but doesn't await it.
   /// For clean shutdown, call disconnect() first and await it.
   void dispose() {
-    // Cancel timers immediately
-    _serverHelloTimer?.cancel();
-    _serverHelloTimer = null;
-
     // Close stream controllers
     _messageController.close();
     _rawMessageController.close();

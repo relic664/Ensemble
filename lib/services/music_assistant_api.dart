@@ -3363,7 +3363,6 @@ class MusicAssistantAPI {
           // Check if it's from a known CDN
           for (final domain in externalDomains) {
             if (uri.host.contains(domain)) {
-              _logger.log('🖼️ Remote mode: using external CDN URL from ${uri.host}');
               // For Spotify, we can request different sizes
               if (uri.host.contains('scdn.co') || uri.host.contains('spotifycdn.com')) {
                 // Spotify image URLs can have size in path, but we'll use as-is
@@ -3373,7 +3372,6 @@ class MusicAssistantAPI {
             }
           }
           // Even if not a known CDN, if it's HTTPS it might work
-          _logger.log('🖼️ Remote mode: trying external URL from ${uri.host}');
           return path;
         } catch (e) {
           // Not a valid URL, continue
@@ -3396,7 +3394,6 @@ class MusicAssistantAPI {
             provider.contains('apple_music') ||
             provider.contains('musicbrainz')) {
           if (path.startsWith('https://')) {
-            _logger.log('🖼️ Remote mode: using $provider image URL');
             return path;
           }
         }
@@ -3404,7 +3401,6 @@ class MusicAssistantAPI {
     }
 
     // No external URLs found - images won't load in remote mode for local files
-    _logger.log('🖼️ Remote mode: no external image URL available');
     return null;
   }
 

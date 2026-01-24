@@ -879,7 +879,8 @@ class MusicAssistantProvider with ChangeNotifier {
       _logger.log('✅ Remote bridge started on port $port');
 
       // Update server URL to the new bridge port
-      final bridgeUrl = 'ws://localhost:$port';
+      // Use 127.0.0.1 instead of localhost for Android compatibility
+      final bridgeUrl = 'ws://127.0.0.1:$port';
       await SettingsService.setServerUrl(bridgeUrl);
 
       // Connect through the bridge

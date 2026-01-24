@@ -541,7 +541,8 @@ class _LoginScreenState extends State<LoginScreen> {
       await SettingsService.setPassword(password);
 
       // Connect to the local bridge endpoint
-      final serverUrl = 'ws://localhost:$port';
+      // Use 127.0.0.1 instead of localhost for Android compatibility
+      final serverUrl = 'ws://127.0.0.1:$port';
       final provider = context.read<MusicAssistantProvider>();
 
       _addDebugLog('Connecting to bridge at $serverUrl');

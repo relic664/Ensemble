@@ -186,10 +186,28 @@ class RemoteBridge {
         return null;
       }
 
-      _logger.log('RemoteBridge: WebRTC connected, authenticating...');
+      _logger.log('RemoteBridge: WebRTC connected, waiting for server hello...');
       _setState(RemoteBridgeState.authenticating);
 
-      // Step 2: Authenticate with MA
+      // Step 2: Wait for server hello before sending any requests
+      // Server needs to send hello first before it's ready to process requests
+      for (int i = 0; i < 50; i++) {  // Wait up to 5 seconds
+        if (_webrtcConnection!.serverInfo != null) {
+          _logger.log('RemoteBridge: Server hello received, authenticating...');
+          break;
+        }
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+
+      if (_webrtcConnection!.serverInfo == null) {
+        _logger.log('RemoteBridge: Server hello timeout');
+        _setState(RemoteBridgeState.failed);
+        _emitError(RemoteBridgeErrorType.timeout, 'Server hello timeout');
+        await stop();
+        return null;
+      }
+
+      // Step 3: Authenticate with MA
       final authenticated = await _authenticate(username, password);
       if (!authenticated) {
         _logger.log('RemoteBridge: Authentication failed');
@@ -201,6 +219,9 @@ class RemoteBridge {
 
       _logger.log('RemoteBridge: Authentication successful');
       _setState(RemoteBridgeState.connected);
+
+      // Sendspin channel is now created upfront with the initial offer
+      // (Both channels must be in the SDP for the server to know about them)
 
       // Step 3: Cache the server hello (it was already received by WebRTCConnection)
       if (_webrtcConnection!.serverInfo != null) {
@@ -671,6 +692,17 @@ class RemoteBridge {
           _reconnectAttempts = 0;
           _scheduleReconnect();
         }
+      }
+
+      // Detect stale connection: channel appears open but no data flowing
+      // This catches the flutter_webrtc bug where data channel goes one-way silently
+      if (_state == RemoteBridgeState.connected &&
+          dcState == 'RTCDataChannelState.RTCDataChannelOpen' &&
+          timeSinceLastMsg > 30 &&
+          !_isReconnecting) {
+        _logger.log('RemoteBridge: Health check detected stale connection - '
+            'channel open but no data for ${timeSinceLastMsg}s, forcing reconnect');
+        _handleWebRTCDisconnection();
       }
     });
   }
